@@ -134,7 +134,7 @@ class QASEF:
             # 'none' and 'fixed': Q stays unchanged
 
             # --- alpha-update: simplex QP via ALM (Eq. 19) ---
-            alpha = self._update_alpha(FG, Q, U, V, n, c)
+            alpha = self._update_alpha(FG, Q, U, V, n, c, alpha_prev=alpha)
 
             # --- Objective ---
             obj = self._objective(FG, Q, alpha, U, M, lam, V, n, c)
@@ -360,11 +360,19 @@ class QASEF:
 
     @staticmethod
     def _update_alpha(FG: list[np.ndarray], Q: np.ndarray, U: np.ndarray,
-                      V: int, n: int, c: int) -> np.ndarray:
-        """Simplex QP for alpha-update via projected gradient descent (Eq. 19).
+                      V: int, n: int, c: int,
+                      alpha_prev: np.ndarray | None = None) -> np.ndarray:
+        """Simplex QP for alpha-update via Augmented Lagrangian Method (Eq. 19).
 
-        min_{1^T alpha = 1, alpha >= 0} alpha^T F_hat alpha - 2 h_hat^T alpha
+        Solves:  min  alpha^T F_hat alpha - 2 h_hat^T alpha
+                 s.t. 1^T alpha = 1, alpha >= 0
+
         where F_hat[v,v'] = Tr(Z_v^T Z_v') and h_hat[v] = Tr(Z_v^T U).
+
+        The equality constraint is handled by a Lagrange multiplier mu and a
+        quadratic penalty rho/2 * (1^T alpha - 1)^2.  Non-negativity is
+        enforced by projecting onto the non-negative orthant after each
+        gradient step.
         """
         # Compute Z_v = diag(q^(v)) F^(v) G for each v
         Z_list = []
@@ -383,18 +391,45 @@ class QASEF:
                 F_hat[v, vp] = val
                 F_hat[vp, v] = val
 
-        # Lipschitz constant for step size
-        L = 2 * np.linalg.eigvalsh(F_hat).max() + 1e-8
-        step = 1.0 / L
+        # ALM parameters
+        ones = np.ones(V, dtype=np.float64)
+        mu = 0.0            # Lagrange multiplier for 1^T alpha = 1
+        rho = 10.0           # Penalty parameter (high init for fast feasibility)
+        rho_max = 1e6
+        rho_factor = 2.0
 
-        alpha = np.ones(V, dtype=np.float64) / V
-        for _ in range(500):
-            grad = 2 * F_hat @ alpha - 2 * h_hat
-            alpha_new = QASEF._project_simplex(alpha - step * grad)
+        # Warm-start from previous solution when available
+        if alpha_prev is not None:
+            alpha = alpha_prev.copy()
+        else:
+            alpha = np.ones(V, dtype=np.float64) / V
 
-            if np.linalg.norm(alpha_new - alpha) < 1e-10:
+        for _ in range(50):  # ALM outer iterations
+            # Hessian of augmented Lagrangian: 2*F_hat + rho*11^T
+            H = 2 * F_hat + rho * np.outer(ones, ones)
+            L_lip = np.linalg.eigvalsh(H).max() + 1e-8
+            step = 1.0 / L_lip
+
+            # Inner loop: minimize L(alpha, mu, rho) s.t. alpha >= 0
+            for _ in range(200):
+                r = ones @ alpha - 1.0
+                grad = 2 * F_hat @ alpha - 2 * h_hat + (mu + rho * r) * ones
+                alpha_new = np.maximum(alpha - step * grad, 0.0)
+
+                if np.linalg.norm(alpha_new - alpha) < 1e-12:
+                    break
+                alpha = alpha_new
+
+            # Dual update
+            r = ones @ alpha - 1.0
+            mu += rho * r
+
+            # Check feasibility
+            if abs(r) < 1e-8:
                 break
-            alpha = alpha_new
+
+            # Increase penalty
+            rho = min(rho * rho_factor, rho_max)
 
         return alpha
 
